@@ -4,7 +4,6 @@ import (
 	"errors"
 	"go/ast"
 	"go/token"
-	"golang.org/x/tools/go/packages"
 	"path/filepath"
 	"strings"
 )
@@ -27,6 +26,7 @@ const (
 
 type Type interface {
 	Kind() Kind
+	Compare(typ Type) bool
 }
 
 type ValueType struct {
@@ -51,6 +51,10 @@ type TypeInfo struct {
 	RawField *ast.Field
 }
 
+func (typeInfo TypeInfo) Compare(another TypeInfo) bool {
+	return false
+}
+
 type FileCallback func(file *File, err error)
 
 type Position struct {
@@ -58,23 +62,8 @@ type Position struct {
 	Column int
 }
 
-type PackageInfo struct {
-	Id         string
-	Name       string
-	Path       string
-	ModuleInfo *ModuleInfo
-	RawPackage *packages.Package
-}
-
-type ModuleInfo struct {
-	Path      string
-	Version   string
-	Main      bool
-	Indirect  bool
-	Dir       string
-	GoMod     string
-	GoVersion string
-	RawModule *packages.Module
+func (pos Position) Compare(another Position) bool {
+	return pos.Line == another.Line && pos.Column == another.Line
 }
 
 type Import struct {
@@ -87,7 +76,7 @@ type Import struct {
 type File struct {
 	Name          string
 	FullPath      string
-	Package       PackageInfo
+	Package       *Package
 	Imports       []Import
 	Consts        []ConstValue
 	Markers       MarkerValues
@@ -100,11 +89,37 @@ type File struct {
 	RawFile          *ast.File
 }
 
+func (file *File) Compare(another *File) bool {
+	if file.Package != another.Package && !file.Package.Compare(another.Package) {
+		return false
+	}
+
+	if file.FullPath != another.FullPath || file.Name != another.Name {
+		return false
+	}
+
+	return true
+}
+
 type AnyKindType struct {
 }
 
 func (typ AnyKindType) Kind() Kind {
 	return AnyKind
+}
+
+func (typ AnyKindType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	_, ok := another.(AnyKindType)
+
+	if !ok {
+		return false
+	}
+
+	return true
 }
 
 type ObjectType struct {
@@ -116,12 +131,34 @@ func (typ ObjectType) Kind() Kind {
 	return Object
 }
 
+func (typ ObjectType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	return true
+}
+
 type PointerType struct {
 	Typ Type
 }
 
 func (typ PointerType) Kind() Kind {
 	return Ptr
+}
+
+func (typ PointerType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	pointerType, ok := another.(PointerType)
+
+	if !ok {
+		return false
+	}
+
+	return typ.Typ.Compare(pointerType)
 }
 
 type ArrayType struct {
@@ -132,6 +169,20 @@ func (typ ArrayType) Kind() Kind {
 	return Array
 }
 
+func (typ ArrayType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	arrayType, ok := another.(ArrayType)
+
+	if !ok {
+		return false
+	}
+
+	return typ.ItemType.Compare(arrayType)
+}
+
 type DictionaryType struct {
 	KeyType   Type
 	ValueType Type
@@ -139,6 +190,20 @@ type DictionaryType struct {
 
 func (typ DictionaryType) Kind() Kind {
 	return Map
+}
+
+func (typ DictionaryType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	dictionaryType, ok := another.(DictionaryType)
+
+	if !ok {
+		return false
+	}
+
+	return typ.KeyType.Compare(dictionaryType.KeyType) && typ.ValueType.Compare(dictionaryType.ValueType)
 }
 
 type ChanDirection int
@@ -157,6 +222,24 @@ func (typ ChanType) Kind() Kind {
 	return Chan
 }
 
+func (typ ChanType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	chanType, ok := another.(ChanType)
+
+	if !ok {
+		return false
+	}
+
+	if typ.Direction != chanType.Direction {
+		return false
+	}
+
+	return typ.Typ.Compare(chanType.Typ)
+}
+
 type FunctionType struct {
 	Name         string
 	IsExported   bool
@@ -170,8 +253,50 @@ type FunctionType struct {
 	RawFuncType  *ast.FuncType
 }
 
-func (function FunctionType) Kind() Kind {
+func (typ FunctionType) Kind() Kind {
 	return Function
+}
+
+func (typ FunctionType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	funcType, ok := another.(FunctionType)
+
+	if !ok {
+		return false
+	}
+
+	if typ.File == nil || funcType.File == nil || !typ.File.Compare(funcType.File) {
+		return false
+	}
+
+	if typ.Name != funcType.Name || typ.IsExported != funcType.IsExported {
+		return false
+	}
+
+	if !typ.Position.Compare(funcType.Position) {
+		return false
+	}
+
+	if len(typ.Parameters) != len(funcType.Parameters) || len(typ.ReturnValues) != len(funcType.ReturnValues) {
+		return false
+	}
+
+	for index, parameter := range typ.Parameters {
+		if !parameter.Compare(funcType.Parameters[index]) {
+			return false
+		}
+	}
+
+	for index, returnValue := range typ.ReturnValues {
+		if !returnValue.Compare(funcType.ReturnValues[index]) {
+			return false
+		}
+	}
+
+	return true
 }
 
 type Field struct {
@@ -186,12 +311,32 @@ type Field struct {
 	RawField   *ast.Field
 }
 
+func (field Field) Compare(another Field) bool {
+	if field.File == nil || another.File == nil || !field.File.Compare(another.File) {
+		return false
+	}
+
+	if field.Name != another.Name || field.IsExported != another.IsExported || field.IsEmbedded != another.IsEmbedded {
+		return false
+	}
+
+	if !field.Position.Compare(another.Position) {
+		return false
+	}
+
+	if field.Type == nil || another.Type == nil || field.Type.Compare(another.Type) {
+		return false
+	}
+
+	return true
+}
+
 type Method struct {
 	Name         string
 	IsExported   bool
 	Position     Position
 	Markers      MarkerValues
-	Receiver     *TypeInfo
+	Receiver     TypeInfo
 	Parameters   []TypeInfo
 	ReturnValues []TypeInfo
 	File         *File
@@ -199,6 +344,42 @@ type Method struct {
 	RawField     *ast.Field
 	RawFuncDecl  *ast.FuncDecl
 	RawFuncType  *ast.FuncType
+}
+
+func (method Method) Compare(another Method) bool {
+	if method.File == nil || another.File == nil || !method.File.Compare(another.File) {
+		return false
+	}
+
+	if method.Name != another.Name || method.IsExported != another.IsExported {
+		return false
+	}
+
+	if !method.Position.Compare(another.Position) {
+		return false
+	}
+
+	if !method.Receiver.Compare(another.Receiver) {
+		return false
+	}
+
+	if len(method.Parameters) != len(another.Parameters) || len(method.ReturnValues) != len(another.ReturnValues) {
+		return false
+	}
+
+	for index, parameter := range method.Parameters {
+		if !parameter.Compare(another.Parameters[index]) {
+			return false
+		}
+	}
+
+	for index, returnValue := range method.ReturnValues {
+		if !returnValue.Compare(another.ReturnValues[index]) {
+			return false
+		}
+	}
+
+	return true
 }
 
 type StructType struct {
@@ -218,6 +399,49 @@ func (typ StructType) Kind() Kind {
 	return Struct
 }
 
+func (typ StructType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	structType, ok := another.(StructType)
+
+	if !ok {
+		return false
+	}
+
+	if !typ.File.Compare(structType.File) {
+		return false
+	}
+
+	if typ.Name != structType.Name || typ.IsExported != structType.IsExported || !typ.Position.Compare(structType.Position) {
+		return false
+	}
+
+	if len(typ.Fields) != len(structType.Fields) || len(typ.Methods) != len(structType.Methods) {
+		return false
+	}
+
+	for index, field := range typ.Fields {
+		if !field.Compare(structType.Fields[index]) {
+			return false
+		}
+	}
+
+	for index, method := range typ.Methods {
+		if !method.Compare(structType.Methods[index]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (typ StructType) Implements(interfaceType InterfaceType) bool {
+
+	return true
+}
+
 type UserDefinedType struct {
 	Name        string
 	IsExported  bool
@@ -233,6 +457,14 @@ type UserDefinedType struct {
 
 func (typ UserDefinedType) Kind() Kind {
 	return UserDefined
+}
+
+func (typ UserDefinedType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	return true
 }
 
 type InterfaceType struct {
@@ -251,6 +483,38 @@ func (typ InterfaceType) Kind() Kind {
 	return Interface
 }
 
+func (typ InterfaceType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	interfaceType, ok := another.(InterfaceType)
+
+	if !ok {
+		return false
+	}
+
+	if !typ.File.Compare(interfaceType.File) {
+		return false
+	}
+
+	if typ.Name != interfaceType.Name || typ.IsExported != interfaceType.IsExported || !typ.Position.Compare(interfaceType.Position) {
+		return false
+	}
+
+	if len(typ.Methods) != len(interfaceType.Methods) {
+		return false
+	}
+
+	for index, method := range typ.Methods {
+		if !method.Compare(interfaceType.Methods[index]) {
+			return false
+		}
+	}
+
+	return true
+}
+
 type AnonymousStructType struct {
 	Fields []Field
 }
@@ -259,12 +523,28 @@ func (typ AnonymousStructType) Kind() Kind {
 	return Struct
 }
 
+func (typ AnonymousStructType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	return true
+}
+
 type VariadicType struct {
 	ItemType Type
 }
 
 func (typ VariadicType) Kind() Kind {
 	return Variadic
+}
+
+func (typ VariadicType) Compare(another Type) bool {
+	if typ.Kind() != another.Kind() {
+		return false
+	}
+
+	return false
 }
 
 func EachFile(collector *Collector, pkgs []*Package, callback FileCallback) {
@@ -433,30 +713,10 @@ func getFile(pkg *Package, file *ast.File, markers map[ast.Node]MarkerValues) *F
 	position := pkg.Fset.Position(file.Pos())
 	fileFullPath := position.Filename
 
-	packageInfo := PackageInfo{
-		Id:         pkg.ID,
-		Name:       file.Name.Name,
-		Path:       pkg.PkgPath,
-		RawPackage: pkg.Package,
-	}
-
-	if pkg.Module != nil {
-		packageInfo.ModuleInfo = &ModuleInfo{
-			Path:      pkg.Module.Path,
-			Version:   pkg.Module.Version,
-			Main:      pkg.Module.Main,
-			Indirect:  pkg.Module.Indirect,
-			Dir:       pkg.Module.Dir,
-			GoMod:     pkg.Module.GoMod,
-			GoVersion: pkg.Module.GoVersion,
-			RawModule: pkg.Module,
-		}
-	}
-
 	return &File{
 		Name:           filepath.Base(fileFullPath),
 		FullPath:       fileFullPath,
-		Package:        packageInfo,
+		Package:        pkg,
 		Imports:        getFileImports(pkg.Fset, file),
 		Consts:         make([]ConstValue, 0),
 		Markers:        markers[file],
@@ -763,7 +1023,6 @@ func getMethod(fileSet *token.FileSet,
 		IsExported:  ast.IsExported(decl.Name.Name),
 		Position:    getPosition(fileSet, funcType.Pos()),
 		Markers:     markers[decl],
-		Receiver:    &TypeInfo{},
 		File:        fileInfo,
 		RawFile:     file,
 		RawFuncDecl: decl,
@@ -782,8 +1041,12 @@ func getMethod(fileSet *token.FileSet,
 	receiver := decl.Recv.List[0]
 	receiverType := getTypeFromExpression(fileSet, fileInfo, file, receiver.Type, markers)
 
-	method.Receiver.Type = receiverType
-	method.Receiver.Name = receiver.Names[0].Name
+	method.Receiver = TypeInfo{
+		Name:     receiver.Names[0].Name,
+		Type:     receiverType,
+		Markers:  nil,
+		RawField: nil,
+	}
 
 	return *method
 }

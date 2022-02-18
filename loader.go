@@ -20,6 +20,18 @@ func newPackage(pkg *packages.Package, loader *loader) *Package {
 	}
 }
 
+func (pkg *Package) Compare(another *Package) bool {
+	if another == nil {
+		return false
+	}
+
+	if pkg == another || pkg.ID == another.ID {
+		return true
+	}
+
+	return false
+}
+
 // loader loads Go packages and their imports.
 type loader struct {
 	config       *packages.Config
